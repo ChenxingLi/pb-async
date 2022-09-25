@@ -67,7 +67,6 @@ mod errors;
 
 pub use errors::{RequestError, StartupError};
 
-use futures::{Future, Stream};
 use http::header::HeaderValue;
 
 static API_ROOT: &str = "https://api.pushbullet.com/v2/";
@@ -92,12 +91,14 @@ impl Client {
     ///     .expect("expected client creation to succeed");
     /// ```
     pub fn new(token: &str) -> Result<Self, StartupError> {
-        let mut connector = hyper_tls::HttpsConnector::new(1).map_err(StartupError::Tls)?;
-        connector.force_https(true);
+        let mut connector = hyper_tls::HttpsConnector::new();
+        connector.https_only(true);
         Ok(Client {
             token: HeaderValue::from_str(token)
                 .map_err(|e| StartupError::InvalidToken(e, token.to_owned()))?,
-            client: hyper::Client::builder().keep_alive(true).build(connector),
+            client: hyper::Client::builder()
+                .pool_max_idle_per_host(std::usize::MAX)
+                .build(connector),
         })
     }
 
@@ -133,8 +134,8 @@ impl Client {
     /// }));
     /// # }
     /// ```
-    pub fn get_user(&self) -> impl Future<Item = User, Error = RequestError> {
-        self.get("users/me").and_then(|(bytes, data)| {
+    pub async fn get_user(&self) -> Result<User, RequestError> {
+        self.get("users/me").await.and_then(|(bytes, data)| {
             serde_json::from_value(data).map_err(|error| RequestError::Json { error, bytes })
         })
     }
@@ -162,12 +163,12 @@ impl Client {
     /// }));
     /// # }
     /// ```
-    pub fn list_devices(&self) -> impl Future<Item = Vec<Device>, Error = RequestError> {
+    pub async fn list_devices(&self) -> Result<Vec<Device>, RequestError> {
         #[derive(Deserialize)]
         struct Devices {
             devices: Vec<Device>,
         }
-        self.get("devices").and_then(|(bytes, data)| {
+        self.get("devices").await.and_then(|(bytes, data)| {
             let d: Devices = serde_json::from_value(data).map_err(|error| RequestError::Json {
                 error,
                 bytes: bytes.clone(),
@@ -204,22 +205,18 @@ impl Client {
     /// );
     /// # }
     /// ```
-    pub fn push(
-        &self,
-        target: PushTarget,
-        data: PushData,
-    ) -> impl Future<Item = (), Error = RequestError> {
+    pub async fn push(&self, target: PushTarget, data: PushData) -> Result<(), RequestError> {
         #[derive(Serialize)]
-        struct Push<'a> {
+        struct Push {
             #[serde(flatten)]
-            data: PushData<'a>,
+            data: PushData,
             #[serde(flatten)]
-            target: PushTarget<'a>,
+            target: PushTarget,
         }
 
         let post_data = serde_json::to_string(&Push { target, data }).unwrap();
 
-        self.post("pushes", post_data.into()).map(|_resp| ())
+        self.post("pushes", post_data.into()).await.map(|_resp| ())
     }
 
     /// Prepares a file for upload prior to pushing it via [`Client::push`].
@@ -260,12 +257,12 @@ impl Client {
     /// );
     /// # }
     /// ```
-    pub fn upload_request(
+    pub async fn upload_request(
         &self,
         file_name: &str,
         file_type: &str,
         upload_data: hyper::Body,
-    ) -> impl Future<Item = UploadRequestResponse, Error = RequestError> {
+    ) -> Result<UploadRequestResponse, RequestError> {
         #[derive(Serialize)]
         struct Upload<'a> {
             file_name: &'a str,
@@ -274,209 +271,205 @@ impl Client {
         let post_data = serde_json::to_string(&Upload {
             file_name,
             file_type,
-        }).unwrap();
+        })
+        .unwrap();
         let token_for_later_use = self.token.clone();
         let client_for_later_use = self.client.clone();
-        self.post("upload-request", post_data.into())
-            .and_then(move |(bytes, data)| {
-                use http::header::*;
-                let RawUploadRequestResponse {
+        let (bytes, data) = self.post("upload-request", post_data.into()).await?;
+
+        let (request, last_response) = {
+            use http::header::*;
+            let RawUploadRequestResponse {
+                file_name,
+                file_type,
+                file_url,
+                upload_url,
+            } = serde_json::from_value(data)
+                .map_err(|error| RequestError::Json { error, bytes })?;
+
+            let mut mpart = mpart_async::client::MultipartRequest::default();
+
+            mpart.add_stream("file", &*file_name, &*file_type, upload_data);
+
+            let request = hyper::Request::post(upload_url)
+                .header(TOKEN_HEADER, token_for_later_use)
+                .header(
+                    CONTENT_TYPE,
+                    &*format!("multipart/form-data; boundary={}", mpart.get_boundary()),
+                )
+                .body(hyper::Body::wrap_stream(mpart))?;
+
+            (
+                request,
+                UploadRequestResponse {
                     file_name,
                     file_type,
                     file_url,
-                    upload_url,
-                } = serde_json::from_value(data)
-                    .map_err(|error| RequestError::Json { error, bytes })?;
+                    _priv: (),
+                },
+            )
+        };
 
-                let mut mpart = mpart_async::MultipartRequest::default();
+        // let (parts, body) = client_for_later_use
+        //     .request(request)
+        //     .await
+        //     .and_then(|response| {
+        //         let (parts, body) = response.into_parts();
+        //         body.concat2().map(|body| (parts, body))
+        //     })
+        //     .map_err(Into::into)?;
 
-                mpart.add_stream(
-                    "file",
-                    &*file_name,
-                    &*file_type,
-                    upload_data.map(|chunk| chunk.into_bytes()),
-                );
+        let response = client_for_later_use.request(request).await?;
 
-                let request = hyper::Request::post(upload_url)
-                    .header(TOKEN_HEADER, token_for_later_use)
-                    .header(
-                        CONTENT_TYPE,
-                        &*format!("multipart/form-data; boundary={}", mpart.get_boundary()),
-                    )
-                    .body(hyper::Body::wrap_stream(mpart))?;
+        let (parts, body) = response.into_parts();
 
-                Ok((
-                    request,
-                    UploadRequestResponse {
-                        file_name,
-                        file_type,
-                        file_url,
-                        _priv: (),
-                    },
-                ))
-            })
-            .and_then(move |(request, last_response)| {
-                client_for_later_use
-                    .request(request)
-                    .and_then(|response| {
-                        let (parts, body) = response.into_parts();
-                        body.concat2().map(|body| (parts, body))
-                    })
-                    .from_err()
-                    .and_then(|(parts, body)| {
-                        let bytes = body.into_bytes();
-                        if !parts.status.is_success() {
-                            return Err(RequestError::Status {
-                                status: parts.status,
-                                bytes: bytes,
-                            });
-                        }
-                        Ok(last_response)
-                    })
-            })
+        let bytes = hyper::body::to_bytes(body).await?;
+        if !parts.status.is_success() {
+            return Err(RequestError::Status {
+                status: parts.status,
+                bytes: bytes,
+            });
+        }
+        Ok(last_response)
     }
 
-    fn get(
+    async fn get(
         &self,
         target: &'static str,
-    ) -> impl Future<Item = (bytes::Bytes, serde_json::Value), Error = RequestError> {
+    ) -> Result<(bytes::Bytes, serde_json::Value), RequestError> {
         self.request(target, hyper::Body::empty(), http::Method::GET, |b| b)
+            .await
     }
 
-    fn post(
+    async fn post(
         &self,
         target: &'static str,
         body: hyper::Body,
-    ) -> impl Future<Item = (bytes::Bytes, serde_json::Value), Error = RequestError> {
-        use hyper::body::Payload;
-        let length = body.content_length()
+    ) -> Result<(bytes::Bytes, serde_json::Value), RequestError> {
+        let length = hyper::body::HttpBody::size_hint(&body)
+            .exact()
             .expect("expected unconditional content length");
         self.request(target, body, http::Method::POST, move |b| {
             b.header(http::header::CONTENT_TYPE, "application/json")
                 .header(http::header::CONTENT_LENGTH, &*format!("{}", length))
         })
+        .await
     }
 
-    fn request(
+    async fn request(
         &self,
         target: &'static str,
         body: hyper::Body,
         method: http::Method,
-        extra: impl FnOnce(&mut http::request::Builder) -> &mut http::request::Builder,
-    ) -> impl Future<Item = (bytes::Bytes, serde_json::Value), Error = RequestError> {
+        extra: impl FnOnce(http::request::Builder) -> http::request::Builder,
+    ) -> Result<(bytes::Bytes, serde_json::Value), RequestError> {
         let request = extra(
             hyper::Request::builder()
                 .method(method)
                 .uri(format!("{}{}", API_ROOT, target))
                 .header(TOKEN_HEADER, self.token.clone()),
-        ).body(body)
-            .expect("expected request to be well-formed");
+        )
+        .body(body)
+        .expect("expected request to be well-formed");
         debug!("sending request: {:?}", request);
-        self.client
-            .request(request)
-            .and_then(|response| {
-                let (parts, body) = response.into_parts();
-                body.concat2().map(|body| (parts, body))
-            })
-            .from_err()
-            .and_then(move |(parts, body)| {
-                let bytes = body.into_bytes();
-                let data: serde_json::Value =
-                    serde_json::from_slice(&*bytes).map_err(|error| RequestError::Json {
-                        error,
-                        bytes: bytes.clone(),
-                    })?;
-                debug!("received json: {:?} from {}", data, target);
-                if let Some(err_data) = data.as_object().and_then(|obj| obj.get("error")) {
-                    #[derive(Deserialize)]
-                    struct ErrorData {
-                        code: String,
-                        message: String,
-                    }
-                    if let Ok(ErrorData { code, message }) =
-                        serde::Deserialize::deserialize(err_data)
-                    {
-                        return Err(RequestError::Server { code, message });
-                    }
-                }
-                if !parts.status.is_success() {
-                    return Err(RequestError::Status {
-                        status: parts.status,
-                        bytes: bytes,
-                    });
-                }
-                Ok((bytes, data))
-            })
+        let response = self.client.request(request).await?;
+
+        let (parts, body) = response.into_parts();
+
+        let bytes = hyper::body::to_bytes(body).await?;
+        let data: serde_json::Value =
+            serde_json::from_slice(&*bytes).map_err(|error| RequestError::Json {
+                error,
+                bytes: bytes.clone(),
+            })?;
+        debug!("received json: {:?} from {}", data, target);
+        if let Some(err_data) = data.as_object().and_then(|obj| obj.get("error")) {
+            #[derive(Deserialize)]
+            struct ErrorData {
+                code: String,
+                message: String,
+            }
+            if let Ok(ErrorData { code, message }) = serde::Deserialize::deserialize(err_data) {
+                return Err(RequestError::Server { code, message });
+            }
+        }
+        if !parts.status.is_success() {
+            return Err(RequestError::Status {
+                status: parts.status,
+                bytes: bytes,
+            });
+        }
+        Ok((bytes, data))
     }
 }
 
 /// Target which data can be pushed to.
 ///
 /// Used in [Client::push].
-#[derive(Serialize, Copy, Clone, Debug)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
-pub enum PushTarget<'a> {
+pub enum PushTarget {
     /// Push to generic self-user stream.
     SelfUser {},
     /// Send to a specific device.
     Device {
         /// Device identifier - see [Device.iden] and [Client::list_devices].
         #[serde(rename = "device_iden")]
-        iden: &'a str,
+        iden: String,
     },
     /// Send to a user by email address, or send by email if this is not a
     /// PushBullet user.
     User {
         /// User email - see [User.email] and [Client::get_user].
-        email: &'a str,
+        email: String,
     },
     /// Send to all subscribers in a channel by tag.
     Channel {
         /// Channel tag. No way to retrieve this in current crate API.
         #[serde(rename = "channel_tag")]
-        tag: &'a str,
+        tag: String,
     },
     /// Send to all users who have granted access to an OAuth by iden.
     Client {
         /// OAuth client iden. No way to retrieve this in current crate API.
         #[serde(rename = "client_iden")]
-        iden: &'a str,
+        iden: String,
     },
 }
 
 /// Data which can be pushed.
 ///
 /// Used in [Client::push].
-#[derive(Serialize, Copy, Clone, Debug)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
-pub enum PushData<'a> {
+pub enum PushData {
     /// Note push.
     Note {
         /// The note's title.
-        title: &'a str,
+        title: String,
         /// The note's message.
-        body: &'a str,
+        body: String,
     },
     /// Link push.
     Link {
         /// The link's title.
-        title: &'a str,
+        title: String,
         /// A message associated with the link.
-        body: &'a str,
+        body: String,
         /// The url to open.
-        url: &'a str,
+        url: String,
     },
     /// File push. Needs to be uploaded first with [Client::upload_request].
     File {
         /// A message to go with the file.
-        body: &'a str,
+        body: String,
         /// The name of the file.
-        file_name: &'a str,
+        file_name: String,
         /// The MIME type of the file.
-        file_type: &'a str,
+        file_type: String,
         /// The url for the file. See [UploadRequestResponse.file_url].
-        file_url: &'a str,
+        file_url: String,
     },
 }
 

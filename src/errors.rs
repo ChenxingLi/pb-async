@@ -1,12 +1,9 @@
 use http::header::InvalidHeaderValue;
-use {bytes, http, hyper, hyper_tls, serde_json};
+use {bytes, http, hyper, serde_json};
 
 /// Error that can occur when creating a client.
 #[derive(Fail, Debug)]
 pub enum StartupError {
-    /// Error starting TLS connector
-    #[fail(display = "tls error: {}", _0)]
-    Tls(hyper_tls::Error),
     /// Token provided was invalid
     #[fail(display = "invalid token: {} (token: {:?})", _0, _1)]
     InvalidToken(InvalidHeaderValue, String),
